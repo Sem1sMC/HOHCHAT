@@ -37,13 +37,15 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// ===================== WEBSOCKET ДЛЯ ЗВОНКОВ =====================
+// ===================== WEBSOCKET ДЛЯ ГОЛОСОВЫХ КАНАЛОВ =====================
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Храним подключения пользователей
 const clients = new Map();
+// Храним участников голосовых каналов
+const voiceChannels = new Map();
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -53,7 +55,6 @@ wss.on('connection', (ws, req) => {
     clients.set(userId, ws);
     console.log(`✅ Пользователь ${userId} подключен к WebSocket`);
     
-    // Отправляем подтверждение
     ws.send(JSON.stringify({
       type: 'connected',
       message: 'WebSocket connected',
@@ -64,21 +65,99 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-      console.log(`📨 Получено сообщение от ${data.from || 'unknown'}:`, data.type);
+      console.log(`📨 Получено от ${data.userId || 'unknown'}:`, data.type);
 
-      // Обработка сигналов WebRTC
-      if (data.targetUserId && clients.has(data.targetUserId)) {
-        const targetWs = clients.get(data.targetUserId);
-        targetWs.send(JSON.stringify({
-          type: data.type,
-          from: data.from,
-          fromUsername: data.fromUsername,
-          data: data.data
-        }));
-        console.log(`📤 Переслано ${data.type} от ${data.from} к ${data.targetUserId}`);
-      } else if (data.type === 'ping') {
-        // Ответ на ping
-        ws.send(JSON.stringify({ type: 'pong' }));
+      switch (data.type) {
+        // ===== ГОЛОСОВЫЕ КАНАЛЫ =====
+        case 'join_voice_channel': {
+          const { channelId, userId, username } = data;
+          
+          // Добавляем пользователя в канал
+          if (!voiceChannels.has(channelId)) {
+            voiceChannels.set(channelId, new Map());
+          }
+          const channel = voiceChannels.get(channelId);
+          channel.set(userId, { username, ws });
+
+          // Уведомляем всех участников канала
+          broadcastToChannel(channelId, {
+            type: 'user_joined',
+            userId: userId,
+            username: username,
+            participants: Array.from(channel.keys())
+          }, userId);
+
+          console.log(`👤 ${username} присоединился к каналу ${channelId}`);
+          break;
+        }
+
+        case 'leave_voice_channel': {
+          const { channelId, userId } = data;
+          
+          if (voiceChannels.has(channelId)) {
+            const channel = voiceChannels.get(channelId);
+            channel.delete(userId);
+            
+            broadcastToChannel(channelId, {
+              type: 'user_left',
+              userId: userId,
+              participants: Array.from(channel.keys())
+            });
+
+            if (channel.size === 0) {
+              voiceChannels.delete(channelId);
+            }
+          }
+          console.log(`👋 Пользователь ${userId} покинул канал`);
+          break;
+        }
+
+        case 'speaking_status': {
+          const { channelId, userId, isSpeaking } = data;
+          broadcastToChannel(channelId, {
+            type: 'speaking_status',
+            userId: userId,
+            isSpeaking: isSpeaking
+          });
+          break;
+        }
+
+        // ===== WEBRTC СИГНАЛИНГ =====
+        case 'offer':
+        case 'answer':
+        case 'candidate': {
+          const { targetUserId } = data;
+          if (targetUserId && clients.has(targetUserId)) {
+            const targetWs = clients.get(targetUserId);
+            if (targetWs.readyState === WebSocket.OPEN) {
+              targetWs.send(JSON.stringify({
+                type: data.type,
+                from: data.userId,
+                fromUsername: data.fromUsername,
+                offer: data.offer,
+                answer: data.answer,
+                candidate: data.candidate
+              }));
+            }
+          }
+          break;
+        }
+
+        case 'get_channel_participants': {
+          const { channelId } = data;
+          if (voiceChannels.has(channelId)) {
+            const channel = voiceChannels.get(channelId);
+            ws.send(JSON.stringify({
+              type: 'channel_participants',
+              channelId: channelId,
+              participants: Array.from(channel.keys())
+            }));
+          }
+          break;
+        }
+
+        default:
+          console.log('📨 Неизвестный тип:', data.type);
       }
     } catch (error) {
       console.error('❌ Ошибка WebSocket:', error);
@@ -86,11 +165,25 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    // Удаляем отключившегося пользователя
+    // Удаляем пользователя из всех каналов
+    for (const [channelId, channel] of voiceChannels) {
+      if (channel.has(userId)) {
+        channel.delete(userId);
+        broadcastToChannel(channelId, {
+          type: 'user_left',
+          userId: userId
+        });
+        if (channel.size === 0) {
+          voiceChannels.delete(channelId);
+        }
+      }
+    }
+
+    // Удаляем из списка клиентов
     for (const [id, client] of clients.entries()) {
       if (client === ws) {
         clients.delete(id);
-        console.log(`👋 Пользователь ${id} отключился от WebSocket`);
+        console.log(`👋 Пользователь ${id} отключился`);
         break;
       }
     }
@@ -100,6 +193,20 @@ wss.on('connection', (ws, req) => {
     console.error('❌ WebSocket ошибка:', error);
   });
 });
+
+// Функция для рассылки в канал
+function broadcastToChannel(channelId, data, excludeUserId = null) {
+  if (!voiceChannels.has(channelId)) return;
+  
+  const channel = voiceChannels.get(channelId);
+  const message = JSON.stringify(data);
+  
+  for (const [userId, userData] of channel) {
+    if (userId !== excludeUserId && userData.ws.readyState === WebSocket.OPEN) {
+      userData.ws.send(message);
+    }
+  }
+}
 
 // ===================== АВТОРИЗАЦИЯ =====================
 
@@ -333,14 +440,18 @@ app.put('/api/user/status', async (req, res) => {
   }
 });
 
-// ===================== WebSocket СТАТУС =====================
+// ===================== СТАТУС WEBSOCKET =====================
 
 app.get('/api/ws/status', (req, res) => {
-  const online = Array.from(clients.keys());
+  const channels = {};
+  for (const [channelId, channel] of voiceChannels) {
+    channels[channelId] = Array.from(channel.keys());
+  }
+  
   res.json({
     wsConnected: true,
     clientsCount: clients.size,
-    onlineUsers: online
+    voiceChannels: channels
   });
 });
 
